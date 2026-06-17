@@ -33,6 +33,8 @@
 #include <cwctype>
 #include <fstream>
 #include <sstream>
+#include <json/json.h>
+#include <unordered_map>
 
 using namespace std;
 
@@ -319,6 +321,69 @@ bool shouldDisableTsfCandidateUiForProcess(const std::wstring& imagePath) {
 	return lowerBaseName == L"cs2.exe" || lowerBaseName == L"csgo.exe";
 }
 
+// Per-process keyboard state persistence (issue #40)
+std::wstring perProcessStateFilePath() {
+	const wchar_t* appData = _wgetenv(L"APPDATA");
+	if (!appData || !*appData) return L"";
+	std::wstring path = appData;
+	path += L"\\Moqi\\per_process_keyboard_state.json";
+	return path;
+}
+
+bool loadPerProcessKeyboardStates(std::unordered_map<std::string, bool>& states) {
+	std::wstring path = perProcessStateFilePath();
+	if (path.empty()) return false;
+	std::ifstream fp(path, std::ifstream::binary);
+	if (!fp) return false;
+	Json::Value root;
+	fp >> root;
+	if (!root.isObject()) return false;
+	for (auto it = root.begin(); it != root.end(); ++it) {
+		if (it->isBool()) {
+			states[it.name()] = it->asBool();
+		}
+	}
+	return true;
+}
+
+bool savePerProcessKeyboardState(const std::string& processName, bool opened) {
+	std::wstring path = perProcessStateFilePath();
+	if (path.empty()) return false;
+
+	std::wstring dir = path.substr(0, path.rfind(L'\\'));
+	::CreateDirectoryW(dir.c_str(), nullptr);
+
+	// Read-modify-write with named mutex to avoid cross-process lost updates
+	HANDLE mutex = ::CreateMutexW(nullptr, FALSE, L"Local\\MoqiPerProcessKeyboardState");
+	if (mutex) ::WaitForSingleObject(mutex, INFINITE);
+
+	std::unordered_map<std::string, bool> states;
+	loadPerProcessKeyboardStates(states);
+	states[processName] = opened;
+
+	Json::Value root(Json::objectValue);
+	for (const auto& kv : states) {
+		root[kv.first] = kv.second;
+	}
+
+	std::wstring tmpPath = path + L".tmp";
+	std::ofstream fp(tmpPath, std::ifstream::binary);
+	bool ok = fp.is_open();
+	if (ok) {
+		Json::StreamWriterBuilder builder;
+		builder["indentation"] = "  ";
+		fp << Json::writeString(builder, root);
+		fp.close();
+		ok = ::MoveFileExW(tmpPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+	}
+
+	if (mutex) {
+		::ReleaseMutex(mutex);
+		::CloseHandle(mutex);
+	}
+	return ok;
+}
+
 }
 
 TextService::TextService(ImeModule* module):
@@ -460,6 +525,7 @@ void TextService::onSetThreadFocus() {
 	    << L" " << foregroundWindowSummary();
 	logDebug(log.str());
 	ensureClientForCurrentProfile(L"onSetThreadFocus");
+	restorePerProcessKeyboardState();
 }
 
 // virtual
@@ -680,6 +746,39 @@ void TextService::onKeyboardStatusChanged(bool opened) {
 			hideCandidates();
 		hideMessage(); // hide message window, if there's any
 	}
+	saveCurrentKeyboardState();
+}
+
+void TextService::restorePerProcessKeyboardState() {
+	std::string processName = utf16ToUtf8(currentProcessName().c_str());
+	if (processName.empty()) return;
+
+	std::unordered_map<std::string, bool> states;
+	if (!loadPerProcessKeyboardStates(states)) return;
+
+	auto it = states.find(processName);
+	if (it == states.end()) return; // no saved state for this process, keep current
+
+	bool savedState = it->second;
+	if (savedState != isKeyboardOpened()) {
+		logDebug(L"[restorePerProcessKeyboardState] process=" + utf8ToUtf16(processName.c_str()) +
+			L" restoring state=" + boolText(savedState));
+		setKeyboardOpen(savedState);
+	}
+}
+
+void TextService::saveCurrentKeyboardState() {
+	// Only save when this process owns the foreground window
+	DWORD fgPid = 0;
+	HWND fgHwnd = ::GetForegroundWindow();
+	if (!fgHwnd) return;
+	::GetWindowThreadProcessId(fgHwnd, &fgPid);
+	if (fgPid != ::GetCurrentProcessId()) return;
+
+	std::string processName = utf16ToUtf8(currentProcessName().c_str());
+	if (processName.empty()) return;
+
+	savePerProcessKeyboardState(processName, isKeyboardOpened());
 }
 
 // called just before current composition is terminated for doing cleanup.

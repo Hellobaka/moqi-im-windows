@@ -337,6 +337,10 @@ private:
 	bool ensureClientForCurrentProfile(const wchar_t* reason);
 	void closeClient();
 
+	// per-process keyboard state persistence (issue #40)
+	void restorePerProcessKeyboardState();
+	void saveCurrentKeyboardState();
+
 private:
 	bool validCandidateListElementId_;
 	DWORD candidateListElementId_;
